@@ -8,6 +8,11 @@ import json
 import pandas as pd
 import requests
 import matplotlib.pyplot as plt
+import subprocess
+import tempfile
+import time
+import signal
+from pathlib import Path
 import anthropic
 import daily_summary
 import json as _json
@@ -46,7 +51,7 @@ class BatteryTelegramBot:
         # API Configuration
         self.api_base_url = "http://91.98.200.67"
         self.data_id = "klassiche-demo-hackathon-evo-9mflyui8"  # TUM Arcisstrasse 80
-        self.default_days_back = 1  # Yesterday's data by default
+        self.default_days_back = 17  # Yesterday's data by default
         
         # Customers JSON store
         self.customers = load_customers_ascii_safe()
@@ -171,7 +176,7 @@ Now write a natural-language summary and just return the summary text, without a
             )
         except Exception as e:
             print(f"Error generating daily summary: {e}")
-            return "⚠️ Unable to generate daily summary right now. Please try again later.", 'telegram_chart.png'
+            return "⚠️ Unable to generate daily summary right now. Please try again later.", ['telegram_chart.png']
         reply_parts = []
         for block in response.content:
             text = getattr(block, 'text', None)
@@ -180,20 +185,128 @@ Now write a natural-language summary and just return the summary text, without a
             if text:
                 reply_parts.append(text)
         message = ''.join(reply_parts) if reply_parts else ''
-        # Chart
-        plt.figure(figsize=(10,4))
-        plt.plot(df['timestamp'], df['pv_profile'], label='PV production')
-        plt.plot(df['timestamp'], df['pv_utilized_kw_opt'], label='PV used')
-        plt.fill_between(df['timestamp'], 0, df['pv_to_battery_kw_opt'], color='green', alpha=0.3, label='Battery charging')
-        plt.fill_between(df['timestamp'], 0, df['battery_to_load_kw_opt'], color='red', alpha=0.3, label='Battery discharging')
-        plt.xlabel('Time')
-        plt.ylabel('kW')
-        plt.title('Energy flow today')
-        plt.legend()
-        plt.tight_layout()
-        plt.savefig('telegram_chart.png')
-        plt.close()
-        return message, 'telegram_chart.png'
+        # Generate charts via battery_graphics (Puppeteer). Fallback to matplotlib if it fails.
+        try:
+            chart_paths = self.generate_charts_with_battery_graphics(df)
+            if chart_paths:
+                return message, chart_paths
+        except Exception as e:
+            print("battery_graphics capture failed:", e)
+
+        # Fallback chart (matplotlib) if Puppeteer flow fails
+        try:
+            plt.figure(figsize=(10,4))
+            plt.plot(df['timestamp'], df['pv_profile'], label='PV production')
+            plt.plot(df['timestamp'], df['pv_utilized_kw_opt'], label='PV used')
+            plt.fill_between(df['timestamp'], 0, df['pv_to_battery_kw_opt'], color='green', alpha=0.3, label='Battery charging')
+            plt.fill_between(df['timestamp'], 0, df['battery_to_load_kw_opt'], color='red', alpha=0.3, label='Battery discharging')
+            plt.xlabel('Time')
+            plt.ylabel('kW')
+            plt.title('Energy flow today')
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig('telegram_chart.png')
+            plt.close()
+            return message, ['telegram_chart.png']
+        except Exception as e:
+            print('Matplotlib fallback failed:', e)
+            return message, []
+
+    def wait_for_http(self, url: str, timeout_seconds: int = 30) -> bool:
+        start = time.time()
+        while time.time() - start < timeout_seconds:
+            try:
+                r = requests.get(url, timeout=2)
+                if r.status_code < 500:
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.5)
+        return False
+
+    def generate_charts_with_battery_graphics(self, df: pd.DataFrame):
+        """Use the battery_graphics app + Puppeteer to export chart PNGs for the provided dataframe.
+        Returns a list of absolute file paths to the images.
+        """
+        project_root = Path(__file__).resolve().parent
+        graphics_dir = project_root / 'battery_graphics'
+        screenshots_dir = graphics_dir / 'screenshots'
+        screenshots_dir.mkdir(parents=True, exist_ok=True)
+
+        # Serialize dataframe to a temporary JSON file matching EnergyDataItem[]
+        tmp_json = None
+        try:
+            # Ensure timestamps are ISO strings
+            df_out = df.copy()
+            if not pd.api.types.is_string_dtype(df_out['timestamp']):
+                df_out['timestamp'] = df_out['timestamp'].astype(str)
+            # Write temp file
+            tmp_fd, tmp_path = tempfile.mkstemp(prefix='energy_data_', suffix='.json')
+            os.close(tmp_fd)
+            tmp_json = Path(tmp_path)
+            with open(tmp_json, 'w', encoding='utf-8') as f:
+                json.dump(df_out.to_dict(orient='records'), f, ensure_ascii=False)
+
+            # Ensure dev server is running. Allow override via env BATTERY_SITE_URL.
+            vite_url = os.environ.get('BATTERY_SITE_URL', 'http://localhost:8080/')
+            spawned = False
+            dev_proc = None
+            if not self.wait_for_http(vite_url, timeout_seconds=2):
+                # Start Vite dev server
+                dev_proc = subprocess.Popen(
+                    ['npm', 'run', 'dev'],
+                    cwd=str(graphics_dir),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1
+                )
+                spawned = True
+                # Wait up to 30s for server to be ready
+                if not self.wait_for_http(vite_url, timeout_seconds=30):
+                    # Stop spawned server and raise
+                    try:
+                        dev_proc.terminate()
+                    except Exception:
+                        pass
+                    raise RuntimeError(f'Vite dev server did not become ready on {vite_url}')
+
+            # Run the capture script
+            cmd = [
+                'node',
+                'scripts/capture-charts.mjs',
+                '--data', str(tmp_json),
+                '--site', vite_url,
+                '--out', 'screenshots',
+                '--delay', os.environ.get('CAPTURE_DELAY_MS', '3000')
+            ]
+            result = subprocess.run(cmd, cwd=str(graphics_dir), capture_output=True, text=True, timeout=120)
+            if result.returncode != 0:
+                print('capture-charts stdout:', result.stdout)
+                print('capture-charts stderr:', result.stderr)
+                raise RuntimeError('capture-charts failed')
+
+            energy_path = screenshots_dir / 'energy-chart.png'
+            battery_path = screenshots_dir / 'battery-price-chart.png'
+            paths = []
+            if energy_path.exists():
+                paths.append(str(energy_path))
+            if battery_path.exists():
+                paths.append(str(battery_path))
+            return paths
+        finally:
+            # Cleanup temp json
+            try:
+                if tmp_json and Path(tmp_json).exists():
+                    os.remove(tmp_json)
+            except Exception:
+                pass
+            # Attempt to stop dev server if we started it (best-effort)
+            try:
+                if 'dev_proc' in locals() and dev_proc is not None and dev_proc.poll() is None:
+                    dev_proc.terminate()
+            except Exception:
+                pass
     
     def add_to_history(self, chat_id: int, role: str, message: str):
         """Add a message to chat history"""
@@ -280,16 +393,20 @@ Now write a natural-language summary and just return the summary text, without a
         chat_id = update.effective_chat.id
         
         # Generate daily summary using the reusable function
-        message, chart_path = await self.generate_daily_summary_data()
+        message, chart_paths = await self.generate_daily_summary_data()
         
         # Store in chat history
         self.add_to_history(chat_id, 'user', '/daily')
-        self.add_to_history(chat_id, 'assistant', f"{message} [Chart sent]")
+        self.add_to_history(chat_id, 'assistant', f"{message} [Charts sent]")
         
         # Send response
         await update.message.reply_text(message)
-        with open(chart_path, 'rb') as chart_file:
-            await context.bot.send_photo(chat_id=update.effective_chat.id, photo=chart_file)
+        for p in chart_paths or []:
+            try:
+                with open(p, 'rb') as chart_file:
+                    await context.bot.send_photo(chat_id=update.effective_chat.id, photo=chart_file)
+            except Exception as e:
+                print('Failed to send chart', p, e)
     
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle text messages with agentic tool calling"""
@@ -370,16 +487,20 @@ Respond now:"""
         # Check if AI wants to call a tool
         if "TOOL_CALL: generate_daily_summary" in ai_response:
             # Generate daily summary
-            summary_message, chart_path = await self.generate_daily_summary_data()
+            summary_message, chart_paths = await self.generate_daily_summary_data()
             
             # Store in chat history
             self.add_to_history(chat_id, 'user', user_message)
-            self.add_to_history(chat_id, 'assistant', f"{summary_message} [Chart sent]")
+            self.add_to_history(chat_id, 'assistant', f"{summary_message} [Charts sent]")
             
             # Send daily summary response
             await update.message.reply_text(summary_message)
-            with open(chart_path, 'rb') as chart_file:
-                await context.bot.send_photo(chat_id=update.effective_chat.id, photo=chart_file)
+            for p in chart_paths or []:
+                try:
+                    with open(p, 'rb') as chart_file:
+                        await context.bot.send_photo(chat_id=update.effective_chat.id, photo=chart_file)
+                except Exception as e:
+                    print('Failed to send chart', p, e)
         elif "TOOL_CALL: initiate_call" in ai_response:
             # Build prompt by reusing the exact daily-summary LLM prompt
             prompt_text, _df = self.build_daily_summary_prompt()

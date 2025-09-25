@@ -1,0 +1,17 @@
+[
+  {
+    "data_id": "klassiche-demo-hackathon-evo-9mflyui8",
+    "name": "TUM Arcisstrasse 80",
+    "business_type": "University",
+    "building_type": "Academic/Research Building",
+    "location": "Munich, Germany",
+    "address": "Arcisstrasse 80, 80333 Munich",
+    "city": "Munich",
+    "country": "Germany",
+    "latitude": 48.1374,
+    "longitude": 11.5755,
+    "capacity_info": "2000 students, mechanical engineering department with heavy machinery",
+    "special_notes": "High energy consumption during academic hours, variable load patterns due to laboratory equipment"
+  }
+]
+

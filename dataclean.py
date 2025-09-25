@@ -1,47 +1,52 @@
 import pandas as pd
 import json
 import requests
+import daily_summary
 
 import os
 import anthropic
 
 
 # Load your JSON as DataFrame
-df = pd.read_json("data/day1.json")
+df = pd.read_json("data/day2.json")
 df['timestamp'] = pd.to_datetime(df['timestamp'])
 
 weather_data = requests.get('https://api.open-meteo.com/v1/forecast?latitude=48.1374&longitude=11.5755&daily=sunshine_duration,daylight_duration&timezone=Europe%2FBerlin&forecast_days=3')
 weather_json = weather_data.json()
 sun_hours_tomorrow = weather_json["daily"]["sunshine_duration"][1] / 60/60
+sun_hours_today = weather_json["daily"]["sunshine_duration"][0] / 60/60
 
-# Daily aggregates
-summary = {
-    "date": str(df['timestamp'].iloc[0].date()),
-    "total_solar": float(round(df['pv_profile'].sum(), 1)),
-    "solar_self_consumed": float(round(df['pv_utilized_kw_opt'].sum(), 1)),
-    "solar_exported": float(round(df['pv_to_grid_kw_opt'].sum(), 1)),
-    "battery_charged": float(round(df['pv_to_battery_kw_opt'].sum() + df['grid_to_battery_kw_opt'].sum(), 1)),
-    "battery_discharged": float(round(df['battery_to_load_kw_opt'].sum() + df['battery_to_grid_kw_opt'].sum(), 1)),
-    "grid_import": float(round(df['grid_import_kw_opt'].sum(), 1)),
-    "grid_export": float(round(df['grid_export_kw_opt'].sum(), 1)),
-    "savings": float(round(df['electricity_savings_step'].sum() + df['feed_in_revenue_delta_step'].sum(), 2)),
-    "peak_price_time": df.loc[df['foreign_power_costs'].idxmax(), 'timestamp'].strftime("%H:%M"),
-    "peak_price": float(round(df['foreign_power_costs'].max(), 2)),
-    "cheap_price_time": df.loc[df['foreign_power_costs'].idxmin(), 'timestamp'].strftime("%H:%M"),
-    "cheap_price": float(round(df['foreign_power_costs'].min(), 2)),
-    # Extra metrics
-    "sunniest_hour": df.loc[df['pv_profile'].idxmax(), 'timestamp'].strftime("%H:%M"),
-    "solar_coverage_pct": float(round(df['pv_utilized_kw_opt'].sum() / df['gross_load'].sum() * 100, 1)),
-    "export_ratio_pct": float(round(df['pv_to_grid_kw_opt'].sum() / df['pv_profile'].sum() * 100, 1)) if df['pv_profile'].sum() > 0 else 0.0,
-    "battery_contribution_pct": float(round((df['battery_to_load_kw_opt'].sum() + df['battery_to_grid_kw_opt'].sum()) / df['net_load'].sum() * 100, 1)),
-    "soc_swing": float(round(df['SOC_opt'].max() - df['SOC_opt'].min(), 2)),
-    "grid_dependence_pct": float(round(df['grid_import_kw_opt'].sum() / df['gross_load'].sum() * 100, 1)),
-    "sun_hours_tomorrow": sun_hours_tomorrow
-}
+# # Daily aggregates
+# summary = {
+#     "date": str(df['timestamp'].iloc[0].date()),
+#     "total_solar": float(round(df['pv_profile'].sum(), 1)),
+#     "solar_self_consumed": float(round(df['pv_utilized_kw_opt'].sum(), 1)),
+#     "solar_exported": float(round(df['pv_to_grid_kw_opt'].sum(), 1)),
+#     "battery_charged": float(round(df['pv_to_battery_kw_opt'].sum() + df['grid_to_battery_kw_opt'].sum(), 1)),
+#     "battery_discharged": float(round(df['battery_to_load_kw_opt'].sum() + df['battery_to_grid_kw_opt'].sum(), 1)),
+#     "grid_import": float(round(df['grid_import_kw_opt'].sum(), 1)),
+#     "grid_export": float(round(df['grid_export_kw_opt'].sum(), 1)),
+#     "savings": float(round(df['electricity_savings_step'].sum() + df['feed_in_revenue_delta_step'].sum(), 2)),
+#     "peak_price_time": df.loc[df['foreign_power_costs'].idxmax(), 'timestamp'].strftime("%H:%M"),
+#     "peak_price": float(round(df['foreign_power_costs'].max(), 2)),
+#     "cheap_price_time": df.loc[df['foreign_power_costs'].idxmin(), 'timestamp'].strftime("%H:%M"),
+#     "cheap_price": float(round(df['foreign_power_costs'].min(), 2)),
+#     # Extra metrics
+#     "sunniest_hour": df.loc[df['pv_profile'].idxmax(), 'timestamp'].strftime("%H:%M"),
+#     "solar_coverage_pct": float(round(df['pv_utilized_kw_opt'].sum() / df['gross_load'].sum() * 100, 1)),
+#     "export_ratio_pct": float(round(df['pv_to_grid_kw_opt'].sum() / df['pv_profile'].sum() * 100, 1)) if df['pv_profile'].sum() > 0 else 0.0,
+#     "battery_contribution_pct": float(round((df['battery_to_load_kw_opt'].sum() + df['battery_to_grid_kw_opt'].sum()) / df['net_load'].sum() * 100, 1)),
+#     "soc_swing": float(round(df['SOC_opt'].max() - df['SOC_opt'].min(), 2)),
+#     "grid_dependence_pct": float(round(df['grid_import_kw_opt'].sum() / df['gross_load'].sum() * 100, 1)),
+#     "sun_hours_tomorrow": sun_hours_tomorrow
+# }
 
-print("Summary done")
+# print("Summary done")
 
-print(summary)
+# print(summary)
+
+advanced_summary = daily_summary.build_daily_summary(df, sun_hours_tomorrow=sun_hours_tomorrow)
+print(advanced_summary)
 
 prompt ="""
 You are an assistant that writes short, friendly and funny daily energy summaries for a solar+battery user. 
@@ -49,11 +54,12 @@ Use the provided data to highlight what was interesting about the day. Do not us
 For example:
 - how sunny it was
 - the sunniest hour
-- when energy was cheap or expensive
+- when energy was cheap or expensive, and how the battery reacted smartly to that
 - how the battery was used (charging/discharging and SOC swings)
 - how much money was saved or earned
 - how much energy was self-consumed versus exported
 - grid dependence percentage
+- CO2 only if asked not in initial summary
 
 At the end include how many sun hours are expected tommorrow and how it will impact the energy consumptioin and prices.
 
@@ -68,7 +74,7 @@ Now write a natural-language summary and just return the summary text, without a
 """
 
 messages = []
-user_input = prompt.format(summary_json=json.dumps(summary, ensure_ascii=False))
+user_input = prompt.format(summary_json=json.dumps(advanced_summary, ensure_ascii=False))
 messages.append({'role': 'user', 'content': user_input})
 
 def get_response(messages):
@@ -130,22 +136,15 @@ data = {
 }
 
 
-response = requests.post(WEBHOOK_URL, json=data)
-if response.status_code == 204:
-    print("Nachricht erfolgreich gesendet!")
-else:
-    print(f"Fehler: {response.status_code}")
+# response = requests.post(WEBHOOK_URL, json=data)
+# if response.status_code == 204:
+#     print("Nachricht erfolgreich gesendet!")
+# else:
+#     print(f"Fehler: {response.status_code}")
 
-files = {
-    "file": open("bild.png", "rb")
-}
-
-response = requests.post(WEBHOOK_URL, files=files)
-if response.status_code == 200:
-    print("Nachricht erfolgreich gesendet!")
-else:
-    print(f"Fehler: {response.status_code}")
-
+# files = {
+#     "file": open("bild.png", "rb")
+# }
 
 
 

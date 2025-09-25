@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 import anthropic
 import daily_summary
 import json as _json
+import call
 from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -50,6 +51,9 @@ class BatteryTelegramBot:
         # Customers JSON store
         self.customers = load_customers_ascii_safe()
         
+        # Call configuration
+        self.call_phone_number = os.environ.get('CALL_TARGET_NUMBER', '+4915228931777')
+        
         # Add handlers
         self.application.add_handler(CommandHandler("daily", self.daily_report))
         self.application.add_handler(CommandHandler("clear_history", self.clear_history))
@@ -58,35 +62,7 @@ class BatteryTelegramBot:
         self.application.add_handler(CommandHandler("customers", self.list_customers))
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
     
-    def clean_text_for_api(self, text: str) -> str:
-        """Legacy: no-op now that API key is ASCII-safe"""
-        return text or ""
-    
-    def get_anthropic_client(self):
-        """Return an Anthropic client with an ASCII-safe API key."""
-        raw_key = os.environ.get('ANTHROPIC_API_KEY', '')
-        if not raw_key:
-            print("Warning: ANTHROPIC_API_KEY is missing or empty")
-        # Keep only printable ASCII, strip surrounding quotes
-        sanitized = ''.join(ch for ch in raw_key.strip() if 32 <= ord(ch) <= 126)
-        if sanitized.startswith('"') and sanitized.endswith('"') and len(sanitized) > 1:
-            sanitized = sanitized[1:-1]
-        if sanitized.startswith("'") and sanitized.endswith("'") and len(sanitized) > 1:
-            sanitized = sanitized[1:-1]
-        if sanitized != raw_key.strip():
-            print("Sanitized ANTHROPIC_API_KEY to ASCII-safe form")
-        return anthropic.Anthropic(api_key=sanitized)
-    
-    def clean_data_for_api(self, data) -> str:
-        """Clean any data structure for API calls"""
-        try:
-            # Convert to JSON with ASCII encoding to catch Unicode issues
-            json_str = json.dumps(data, ensure_ascii=True, default=str)
-            # Clean any remaining problematic characters
-            return json_str
-        except Exception as e:
-            print(f"Error cleaning data: {e}")
-            return "Data unavailable due to encoding issues"
+    # Simplified: removed legacy cleaning helpers
     
     def get_customer_context(self) -> str:
         for c in self.customers:
@@ -134,27 +110,18 @@ class BatteryTelegramBot:
             df['timestamp'] = pd.to_datetime(df['timestamp'])
             return df, {"source": "local_fallback"}
     
-    async def generate_daily_summary_data(self, days_back=None):
-        """Generate daily summary data and chart - callable by LLM as a tool"""
-        # Fetch data from API
+    def build_daily_summary_prompt(self, days_back=None):
+        """Build and return the exact daily-summary LLM prompt and the dataframe for charting."""
         df, metadata = self.fetch_energy_data(days_back)
-        
-        # Fetch weather
         weather_data = requests.get('https://api.open-meteo.com/v1/forecast?latitude=48.1374&longitude=11.5755&daily=sunshine_duration,daylight_duration&timezone=Europe%2FBerlin&forecast_days=3')
         weather_json = weather_data.json()
         sun_hours_tomorrow = weather_json["daily"]["sunshine_duration"][1] / 3600
         sun_hours_today = weather_json["daily"]["sunshine_duration"][0] / 3600
-        
-        # Build advanced summary
         summary = daily_summary.build_daily_summary(df, sun_hours_today=sun_hours_today, sun_hours_tomorrow=sun_hours_tomorrow)
-        
-        # Add metadata and customer context (now ASCII-safe from database)
         data_source = metadata.get('source', 'api')
         requested_date = metadata.get('requested_date', 'recent')
         customer_context = self.get_customer_context()
-        summary_data = self.clean_data_for_api(summary)
-        
-        # AI prompt for daily summary
+        summary_data = json.dumps(summary, ensure_ascii=False)
         prompt = f"""You are an assistant that writes short, friendly and funny daily energy summaries for a solar+battery system. 
 Use the provided data to highlight what was interesting about the day. Do not use all the data, just the most interesting bits.
 
@@ -180,10 +147,13 @@ Here is the data:
 {summary_data}
 
 Now write a natural-language summary and just return the summary text, without any extra commentary."""
-        
-        # Call AI for summary
-        client = self.get_anthropic_client()
-        
+        return prompt, df
+
+    async def generate_daily_summary_data(self, days_back=None):
+        """Generate daily summary text and chart."""
+        prompt, df = self.build_daily_summary_prompt(days_back)
+        api_key = os.environ.get('ANTHROPIC_API_KEY', '').strip()
+        client = anthropic.Anthropic(api_key=api_key)
         try:
             response = client.messages.create(
                 model='claude-3-5-haiku-20241022',
@@ -192,10 +162,7 @@ Now write a natural-language summary and just return the summary text, without a
             )
         except Exception as e:
             print(f"Error generating daily summary: {e}")
-            # Fallback message
             return "⚠️ Unable to generate daily summary right now. Please try again later.", 'telegram_chart.png'
-        
-        # Extract text
         reply_parts = []
         for block in response.content:
             text = getattr(block, 'text', None)
@@ -204,8 +171,7 @@ Now write a natural-language summary and just return the summary text, without a
             if text:
                 reply_parts.append(text)
         message = ''.join(reply_parts) if reply_parts else ''
-        
-        # Create chart
+        # Chart
         plt.figure(figsize=(10,4))
         plt.plot(df['timestamp'], df['pv_profile'], label='PV production')
         plt.plot(df['timestamp'], df['pv_utilized_kw_opt'], label='PV used')
@@ -218,7 +184,6 @@ Now write a natural-language summary and just return the summary text, without a
         plt.tight_layout()
         plt.savefig('telegram_chart.png')
         plt.close()
-        
         return message, 'telegram_chart.png'
     
     def add_to_history(self, chat_id: int, role: str, message: str):
@@ -322,6 +287,7 @@ Now write a natural-language summary and just return the summary text, without a
         user_message = update.message.text
         chat_id = update.effective_chat.id
         
+        
         # Get chat history for context
         chat_history = self.get_history_text(chat_id)
         
@@ -338,7 +304,7 @@ Now write a natural-language summary and just return the summary text, without a
         requested_date = metadata.get('requested_date', 'recent')
         customer_context = self.get_customer_context()
         clean_chat_history = chat_history
-        summary_data = self.clean_data_for_api(summary)
+        summary_data = json.dumps(summary, ensure_ascii=False)
         
         # Agentic prompt with tool calling capability
         prompt = f"""You are a helpful battery assistant with access to tools. You can answer questions about the solar+battery system.
@@ -352,19 +318,22 @@ CURRENT USER MESSAGE: {user_message}
 
 AVAILABLE TOOLS:
 - generate_daily_summary: Use this when the user asks for a daily summary, daily report, today's performance, or wants to know what happened today. This generates a comprehensive daily summary with charts.
+- initiate_call: Use this when the user asks to talk, wants a call, requests a phone conversation, or similar. Provide a short one-sentence purpose for the call.
 
 BATTERY DATA ({data_source} data for {requested_date}):
 {summary_data}
 
 INSTRUCTIONS:
 1. If the user is asking for a daily summary/report/today's performance, respond with: "TOOL_CALL: generate_daily_summary"
-2. Otherwise, answer their question using the battery data in 1-3 friendly sentences with emojis
-3. Use conversation history for continuity and context
+2. If the user asks for a call (talk/call/phone/speak), respond with: "TOOL_CALL: initiate_call"
+3. Otherwise, answer their question using the battery data in 1-3 friendly sentences with emojis
+4. Use conversation history for continuity and context
 
 Respond now:"""
         
         # Call AI with tool detection
-        client = self.get_anthropic_client()
+        api_key = os.environ.get('ANTHROPIC_API_KEY', '').strip()
+        client = anthropic.Anthropic(api_key=api_key)
         
         try:
             response = client.messages.create(
@@ -388,7 +357,7 @@ Respond now:"""
                 reply_parts.append(text)
         ai_response = ''.join(reply_parts) if reply_parts else ''
         
-        # Check if AI wants to call the daily summary tool
+        # Check if AI wants to call a tool
         if "TOOL_CALL: generate_daily_summary" in ai_response:
             # Generate daily summary
             summary_message, chart_path = await self.generate_daily_summary_data()
@@ -401,6 +370,16 @@ Respond now:"""
             await update.message.reply_text(summary_message)
             with open(chart_path, 'rb') as chart_file:
                 await context.bot.send_photo(chat_id=update.effective_chat.id, photo=chart_file)
+        elif "TOOL_CALL: initiate_call" in ai_response:
+            # Build prompt by reusing the exact daily-summary LLM prompt
+            prompt_text, _df = self.build_daily_summary_prompt()
+            try:
+                call.submit_batch_call(self.call_phone_number, prompt=prompt_text)
+                self.add_to_history(chat_id, 'user', user_message)
+                self.add_to_history(chat_id, 'assistant', "📞 Call initiated with daily summary context")
+                await update.message.reply_text('📞 Initiating a call now. We will reach out shortly.')
+            except Exception as e:
+                await update.message.reply_text(f"⚠️ Could not initiate call: {e}")
         else:
             # Regular response
             self.add_to_history(chat_id, 'user', user_message)

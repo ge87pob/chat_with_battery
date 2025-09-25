@@ -10,10 +10,29 @@ import requests
 import matplotlib.pyplot as plt
 import anthropic
 import daily_summary
+import json as _json
 from datetime import datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv
+def load_customers_ascii_safe(path: str = "customers.json"):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            customers = _json.load(f)
+        # Ensure ASCII-safe
+        cleaned = []
+        for c in customers:
+            c2 = {}
+            for k, v in c.items():
+                if isinstance(v, str):
+                    c2[k] = v.encode('ascii', errors='ignore').decode('ascii')
+                else:
+                    c2[k] = v
+            cleaned.append(c2)
+        return cleaned
+    except Exception as e:
+        print(f"Failed to load customers.json: {e}")
+        return []
 
 load_dotenv()
 
@@ -23,17 +42,102 @@ class BatteryTelegramBot:
         self.chat_histories = {}  # Store chat history per chat_id
         self.max_history_messages = 20  # Limit history to last 20 messages per chat
         
+        # API Configuration
+        self.api_base_url = "http://91.98.200.67"
+        self.data_id = "klassiche-demo-hackathon-evo-9mflyui8"  # TUM Arcisstrasse 80
+        self.default_days_back = 1  # Yesterday's data by default
+        
+        # Customers JSON store
+        self.customers = load_customers_ascii_safe()
+        
         # Add handlers
         self.application.add_handler(CommandHandler("daily", self.daily_report))
         self.application.add_handler(CommandHandler("clear_history", self.clear_history))
         self.application.add_handler(CommandHandler("history", self.show_history))
+        self.application.add_handler(CommandHandler("customer_info", self.show_customer_info))
+        self.application.add_handler(CommandHandler("customers", self.list_customers))
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
     
-    async def generate_daily_summary_data(self):
+    def clean_text_for_api(self, text: str) -> str:
+        """Legacy: no-op now that API key is ASCII-safe"""
+        return text or ""
+    
+    def get_anthropic_client(self):
+        """Return an Anthropic client with an ASCII-safe API key."""
+        raw_key = os.environ.get('ANTHROPIC_API_KEY', '')
+        if not raw_key:
+            print("Warning: ANTHROPIC_API_KEY is missing or empty")
+        # Keep only printable ASCII, strip surrounding quotes
+        sanitized = ''.join(ch for ch in raw_key.strip() if 32 <= ord(ch) <= 126)
+        if sanitized.startswith('"') and sanitized.endswith('"') and len(sanitized) > 1:
+            sanitized = sanitized[1:-1]
+        if sanitized.startswith("'") and sanitized.endswith("'") and len(sanitized) > 1:
+            sanitized = sanitized[1:-1]
+        if sanitized != raw_key.strip():
+            print("Sanitized ANTHROPIC_API_KEY to ASCII-safe form")
+        return anthropic.Anthropic(api_key=sanitized)
+    
+    def clean_data_for_api(self, data) -> str:
+        """Clean any data structure for API calls"""
+        try:
+            # Convert to JSON with ASCII encoding to catch Unicode issues
+            json_str = json.dumps(data, ensure_ascii=True, default=str)
+            # Clean any remaining problematic characters
+            return json_str
+        except Exception as e:
+            print(f"Error cleaning data: {e}")
+            return "Data unavailable due to encoding issues"
+    
+    def get_customer_context(self) -> str:
+        for c in self.customers:
+            if c.get('data_id') == self.data_id:
+                parts = [f"Customer: {c.get('name','Unknown')}" ]
+                if c.get('business_type'): parts.append(f"Business: {c['business_type']}")
+                if c.get('building_type'): parts.append(f"Building: {c['building_type']}")
+                if c.get('location'): parts.append(f"Location: {c['location']}")
+                if c.get('capacity_info'): parts.append(f"Details: {c['capacity_info']}")
+                if c.get('special_notes'): parts.append(f"Notes: {c['special_notes']}")
+                return " | ".join(parts)
+        return f"Customer: Unknown | ID: {self.data_id}"
+
+    def fetch_energy_data(self, days_back=None):
+        """Fetch energy data from the API"""
+        if days_back is None:
+            days_back = self.default_days_back
+            
+        url = f"{self.api_base_url}/api/energy-data"
+        params = {
+            "id": self.data_id,
+            "days_back": days_back
+        }
+        
+        try:
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            
+            api_data = response.json()
+            
+            # Convert to pandas DataFrame like the original format
+            df = pd.DataFrame(api_data['data'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            
+            # Add metadata for context
+            metadata = api_data.get('metadata', {})
+            
+            return df, metadata
+            
+        except requests.exceptions.RequestException as e:
+            print(f"Error fetching data from API: {e}")
+            # Fallback to local data if API fails
+            print("Falling back to local data...")
+            df = pd.read_json("data/day1.json")
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            return df, {"source": "local_fallback"}
+    
+    async def generate_daily_summary_data(self, days_back=None):
         """Generate daily summary data and chart - callable by LLM as a tool"""
-        # Load data
-        df = pd.read_json("data/day1.json")
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        # Fetch data from API
+        df, metadata = self.fetch_energy_data(days_back)
         
         # Fetch weather
         weather_data = requests.get('https://api.open-meteo.com/v1/forecast?latitude=48.1374&longitude=11.5755&daily=sunshine_duration,daylight_duration&timezone=Europe%2FBerlin&forecast_days=3')
@@ -44,10 +148,18 @@ class BatteryTelegramBot:
         # Build advanced summary
         summary = daily_summary.build_daily_summary(df, sun_hours_today=sun_hours_today, sun_hours_tomorrow=sun_hours_tomorrow)
         
+        # Add metadata and customer context (now ASCII-safe from database)
+        data_source = metadata.get('source', 'api')
+        requested_date = metadata.get('requested_date', 'recent')
+        customer_context = self.get_customer_context()
+        summary_data = self.clean_data_for_api(summary)
+        
         # AI prompt for daily summary
-        prompt = """
-You are an assistant that writes short, friendly and funny daily energy summaries for a solar+battery user. 
+        prompt = f"""You are an assistant that writes short, friendly and funny daily energy summaries for a solar+battery system. 
 Use the provided data to highlight what was interesting about the day. Do not use all the data, just the most interesting bits.
+
+CUSTOMER: {customer_context}
+DATA INFO: Using {data_source} data for {requested_date}
 For example:
 - how sunny it was
 - the sunniest hour
@@ -60,26 +172,28 @@ For example:
 
 At the end include how many sun hours are expected tommorrow and how it will impact the energy consumptioin and prices.
 
-Make the summary 1–3 sentences long, include as many emojis as possible, 
+Make the summary 1-3 sentences long, include as many emojis as possible, 
 and keep it positive and easy to understand. Please use units and include quantity where possible.
 Make it as fun as you can! Be aware that you are sending text messages on the phone, so use appropriate formatting.
 
 Here is the data:
-{summary_json}
+{summary_data}
 
-Now write a natural-language summary and just return the summary text, without any extra commentary.
-        """
+Now write a natural-language summary and just return the summary text, without any extra commentary."""
         
         # Call AI for summary
-        api_key = os.environ.get('ANTHROPIC_API_KEY', '').strip()
-        client = anthropic.Anthropic(api_key=api_key)
-        user_input = prompt.format(summary_json=json.dumps(summary, ensure_ascii=False))
+        client = self.get_anthropic_client()
         
-        response = client.messages.create(
-            model='claude-3-5-haiku-20241022',
-            max_tokens=300,
-            messages=[{'role': 'user', 'content': user_input}]
-        )
+        try:
+            response = client.messages.create(
+                model='claude-3-5-haiku-20241022',
+                max_tokens=300,
+                messages=[{'role': 'user', 'content': prompt}]
+            )
+        except Exception as e:
+            print(f"Error generating daily summary: {e}")
+            # Fallback message
+            return "⚠️ Unable to generate daily summary right now. Please try again later.", 'telegram_chart.png'
         
         # Extract text
         reply_parts = []
@@ -148,6 +262,45 @@ Now write a natural-language summary and just return the summary text, without a
         history_text = self.get_history_text(chat_id)
         await update.message.reply_text(f"📜 **Chat History:**\n\n{history_text}")
     
+    async def show_customer_info(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show current customer information"""
+        customer = None
+        for c in self.customers:
+            if c.get('data_id') == self.data_id:
+                customer = c
+                break
+        if not customer:
+            await update.message.reply_text(f"❌ Customer not found for ID: {self.data_id}")
+            return
+        def val(x):
+            return x if (x is not None and x != "") else 'N/A'
+        info_text = (
+            "🏢 **Customer Information**\n\n"
+            f"**Name:** {val(customer.get('name'))}\n"
+            f"**Business:** {val(customer.get('business_type'))}\n"
+            f"**Building:** {val(customer.get('building_type'))}\n"
+            f"**Location:** {val(customer.get('location'))}\n"
+            f"**Address:** {val(customer.get('address'))}\n\n"
+            f"**Details:** {val(customer.get('capacity_info'))}\n"
+            f"**Notes:** {val(customer.get('special_notes'))}\n\n"
+            f"**Data ID:** `{val(customer.get('data_id'))}`"
+        )
+        await update.message.reply_text(info_text)
+    
+    async def list_customers(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """List all customers from JSON"""
+        if not self.customers:
+            await update.message.reply_text("📋 No customers found.")
+            return
+        out = ["📋 **All Customers:**\n"]
+        for c in self.customers:
+            status = "🟢 Active" if c.get('data_id') == self.data_id else "⚪ Available"
+            out.append(f"{status} **{c.get('name','Unknown')}**")
+            out.append(f"   📍 {c.get('location','Unknown location')}")
+            out.append(f"   🏢 {c.get('business_type','Unknown business')}")
+            out.append(f"   🆔 `{c.get('data_id','')}`\n")
+        await update.message.reply_text("\n".join(out))
+    
     async def daily_report(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Daily battery report command handler"""
         chat_id = update.effective_chat.id
@@ -172,47 +325,58 @@ Now write a natural-language summary and just return the summary text, without a
         # Get chat history for context
         chat_history = self.get_history_text(chat_id)
         
-        # Load basic battery data for context
-        df = pd.read_json("data/day1.json")
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        # Load basic battery data for context using API
+        df, metadata = self.fetch_energy_data()
         weather_data = requests.get('https://api.open-meteo.com/v1/forecast?latitude=48.1374&longitude=11.5755&daily=sunshine_duration,daylight_duration&timezone=Europe%2FBerlin&forecast_days=3')
         weather_json = weather_data.json()
         sun_hours_tomorrow = weather_json["daily"]["sunshine_duration"][1] / 3600
         sun_hours_today = weather_json["daily"]["sunshine_duration"][0] / 3600
         summary = daily_summary.build_daily_summary(df, sun_hours_today=sun_hours_today, sun_hours_tomorrow=sun_hours_tomorrow)
         
+        # Add metadata and customer context for regular chat
+        data_source = metadata.get('source', 'api')
+        requested_date = metadata.get('requested_date', 'recent')
+        customer_context = self.get_customer_context()
+        clean_chat_history = chat_history
+        summary_data = self.clean_data_for_api(summary)
+        
         # Agentic prompt with tool calling capability
-        prompt = f"""
-You are a helpful battery assistant with access to tools. You can answer questions about the user's solar battery system and take actions based on their requests.
+        prompt = f"""You are a helpful battery assistant with access to tools. You can answer questions about the solar+battery system.
+
+CUSTOMER: {customer_context}
 
 CONVERSATION HISTORY:
-{chat_history}
+{clean_chat_history}
 
 CURRENT USER MESSAGE: {user_message}
 
 AVAILABLE TOOLS:
 - generate_daily_summary: Use this when the user asks for a daily summary, daily report, today's performance, or wants to know what happened today. This generates a comprehensive daily summary with charts.
 
-DAILY BATTERY DATA (for answering other questions):
-{json.dumps(summary, ensure_ascii=False)}
+BATTERY DATA ({data_source} data for {requested_date}):
+{summary_data}
 
 INSTRUCTIONS:
 1. If the user is asking for a daily summary/report/today's performance, respond with: "TOOL_CALL: generate_daily_summary"
 2. Otherwise, answer their question using the battery data in 1-3 friendly sentences with emojis
 3. Use conversation history for continuity and context
 
-Respond now:
-        """
+Respond now:"""
         
         # Call AI with tool detection
-        api_key = os.environ.get('ANTHROPIC_API_KEY', '').strip()
-        client = anthropic.Anthropic(api_key=api_key)
+        client = self.get_anthropic_client()
         
-        response = client.messages.create(
-            model='claude-3-5-haiku-20241022',
-            max_tokens=200,
-            messages=[{'role': 'user', 'content': prompt}]
-        )
+        try:
+            response = client.messages.create(
+                model='claude-3-5-haiku-20241022',
+                max_tokens=200,
+                messages=[{'role': 'user', 'content': prompt}]
+            )
+        except Exception as e:
+            print(f"Error calling AI API: {e}")
+            # Fallback response
+            await update.message.reply_text("⚠️ Sorry, I'm having trouble processing your request right now. Please try again later.")
+            return
         
         # Extract response
         reply_parts = []

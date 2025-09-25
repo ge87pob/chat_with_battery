@@ -51,8 +51,8 @@ class BatteryTelegramBot:
         # Customers JSON store
         self.customers = load_customers_ascii_safe()
         
-        # Call configuration
-        self.call_phone_number = os.environ.get('CALL_TARGET_NUMBER', '+4915228931777')
+        # Call configuration: prefer customer phone stored in customers.json
+        self.call_phone_number = None  # resolved dynamically
         
         # Add handlers
         self.application.add_handler(CommandHandler("daily", self.daily_report))
@@ -75,6 +75,15 @@ class BatteryTelegramBot:
                 if c.get('special_notes'): parts.append(f"Notes: {c['special_notes']}")
                 return " | ".join(parts)
         return f"Customer: Unknown | ID: {self.data_id}"
+
+    def get_call_phone_number(self) -> str:
+        """Return phone number from the active customer record, or env fallback."""
+        for c in self.customers:
+            if c.get('data_id') == self.data_id:
+                phone = c.get('phone_number')
+                if phone:
+                    return phone
+        return os.environ.get('CALL_TARGET_NUMBER', '+4917623883131')
 
     def fetch_energy_data(self, days_back=None):
         """Fetch energy data from the API"""
@@ -326,8 +335,9 @@ BATTERY DATA ({data_source} data for {requested_date}):
 INSTRUCTIONS:
 1. If the user is asking for a daily summary/report/today's performance, respond with: "TOOL_CALL: generate_daily_summary"
 2. If the user asks for a call (talk/call/phone/speak), respond with: "TOOL_CALL: initiate_call"
-3. Otherwise, answer their question using the battery data in 1-3 friendly sentences with emojis
-4. Use conversation history for continuity and context
+3. If the user is frustrated or doesn't seem to understand the answer, offer to call them (do not tool call yet).
+4. Otherwise, answer their question using the battery data in 1-3 friendly sentences with emojis
+5. Use conversation history for continuity and context
 
 Respond now:"""
         
@@ -373,10 +383,43 @@ Respond now:"""
         elif "TOOL_CALL: initiate_call" in ai_response:
             # Build prompt by reusing the exact daily-summary LLM prompt
             prompt_text, _df = self.build_daily_summary_prompt()
+            # Also build a custom first message using Anthropic with recent chat history
+            chat_context = self.get_history_text(chat_id)
+            fm_prompt = f"""You are a voice assistant calling the user about their solar+battery energy day.
+Given the following conversation history and the fact that the call is being initiated now, write a single, friendly, concise first sentence to start the call.
+It should reference the user's last request where relevant and briefly mention why you are calling.
+Keep it natural and spoken, 10-20 words, no emojis.
+
+CONVERSATION HISTORY (most recent last):
+{chat_context}
+
+Return only the one sentence to say on the call."""
+            api_key = os.environ.get('ANTHROPIC_API_KEY', '').strip()
+            client = anthropic.Anthropic(api_key=api_key)
+            first_message = None
             try:
-                call.submit_batch_call(self.call_phone_number, prompt=prompt_text)
+                fm_resp = client.messages.create(
+                    model='claude-3-5-haiku-20241022',
+                    max_tokens=60,
+                    messages=[{'role': 'user', 'content': fm_prompt}]
+                )
+                parts = []
+                for block in fm_resp.content:
+                    text = getattr(block, 'text', None)
+                    if text is None and isinstance(block, dict):
+                        text = block.get('text')
+                    if text:
+                        parts.append(text)
+                first_message = ''.join(parts).strip()
+            except Exception as e:
+                print("Failed to generate first message:", e)
+                first_message = None
+
+            try:
+                target_number = self.get_call_phone_number()
+                call.submit_batch_call(target_number, prompt=prompt_text, first_message=first_message)
                 self.add_to_history(chat_id, 'user', user_message)
-                self.add_to_history(chat_id, 'assistant', "📞 Call initiated with daily summary context")
+                self.add_to_history(chat_id, 'assistant', f"📞 Call initiated. First line: {first_message or '[default]'}")
                 await update.message.reply_text('📞 Initiating a call now. We will reach out shortly.')
             except Exception as e:
                 await update.message.reply_text(f"⚠️ Could not initiate call: {e}")

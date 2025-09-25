@@ -8,7 +8,7 @@ import anthropic
 
 
 # Load your JSON as DataFrame
-df = pd.read_json("data/day2.json")
+df = pd.read_json("data/day1.json")
 df['timestamp'] = pd.to_datetime(df['timestamp'])
 
 weather_data = requests.get('https://api.open-meteo.com/v1/forecast?latitude=48.1374&longitude=11.5755&daily=sunshine_duration,daylight_duration&timezone=Europe%2FBerlin&forecast_days=3')
@@ -78,8 +78,8 @@ user_input = prompt.format(summary_json=json.dumps(advanced_summary, ensure_asci
 messages.append({'role': 'user', 'content': user_input})
 
 def get_response(messages):
-    api_key = os.environ.get('ANTHROPIC_API_KEY')
-    if not api_key:
+    api_key = os.environ.get('ANTHROPIC_API_KEY', '').strip()
+    if not api_key or '\n' in api_key or '\r' in api_key:
         raise RuntimeError('Missing ANTHROPIC_API_KEY environment variable')
 
     client = anthropic.Anthropic(api_key=api_key)
